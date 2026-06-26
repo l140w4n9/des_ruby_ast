@@ -1,179 +1,14 @@
-import re
-from typing import List, Optional, Any, Dict
+from typing import Optional
 
-# 解析正则
-RE_NODE_HDR = re.compile(r'@ (\w+)(?: \((?:line: )?(\d+)\))?')
-RE_ATTR = re.compile(r'\+\-\s*([\w\-\>]+):\s*(.*)')
-RE_NULL = re.compile(r'^\(null\b|\(empty\b', re.I)
-
-
-def preprocess_lines(text: str) -> List[str]:
-    lines = []
-    for raw in text.splitlines():
-        s = raw
-        if '#' in s:
-            idx = s.find('#')
-            s = s[idx + 1:]
-            if s.startswith(' '):
-                s = s[1:]
-        lines.append(s.rstrip('\n'))
-    return lines
-
-
-def calc_indent(line: str) -> (int, str):
-    i = 0
-    s = line
-    while True:
-        if s.startswith('|   '):
-            i += 1
-            s = s[4:]
-        elif s.startswith('    '):
-            i += 1
-            s = s[4:]
-        else:
-            break
-    return i, s.lstrip()
-
-
-class Node:
-    def __init__(self, ntype=None, line_no=None):
-        self.type = ntype
-        self.line = line_no
-        self.attrs: Dict[str, Any] = {}
-        self.children: List['Node'] = []
-        self.parent: Optional['Node'] = None
-        self._pending_attr: Optional[str] = None
-
-    def add_child(self, child):
-        child.parent = self
-        self.children.append(child)
-
-    def __repr__(self):
-        return f"<Node {self.type} line={self.line} attrs={list(self.attrs.keys())} children={len(self.children)}>"
-
-
-def parse_value(val: str):
-    if val.lower() == 'nil':
-        return None
-    if val.startswith(':'):
-        return val[1:]
-    if val.startswith('"') and val.endswith('"'):
-        return val[1:-1]
-    if re.match(r'^-?\d+$', val):
-        return int(val)
-    if re.match(r'^-?\d+\.\d+$', val):
-        return float(val)
-    if val == '':
-        return ''
-    return val
-
-
-def parse_dump(text: str) -> Optional[Node]:
-    lines = preprocess_lines(text)
-    stack: List[(int, Node)] = []
-    root = None
-
-    for raw in lines:
-        if not raw.strip():
-            continue
-
-        indent, content = calc_indent(raw)
-        mnode = RE_NODE_HDR.search(content)
-
-        if mnode:
-            ntype = mnode.group(1)
-            lineno = int(mnode.group(2)) if mnode.group(2) else None
-            node = Node(ntype, lineno)
-
-            if not stack:
-                root = node
-                stack.append((indent, node))
-            else:
-                while stack and stack[-1][0] >= indent:
-                    stack.pop()
-
-                parent = stack[-1][1] if stack else None
-                if parent:
-                    parent.add_child(node)
-                    if parent._pending_attr:
-                        parent.attrs[parent._pending_attr] = node
-                        parent._pending_attr = None
-
-                stack.append((indent, node))
-            continue
-
-        matt = RE_ATTR.match(content)
-        if matt:
-            key = matt.group(1)
-            val = matt.group(2).strip()
-            parent = None
-
-            for i in range(len(stack) - 1, -1, -1):
-                if stack[i][0] < indent + 1:
-                    parent = stack[i][1]
-                    break
-
-            if parent is None:
-                parent = stack[-1][1] if stack else None
-            if parent is None:
-                continue
-
-            if not val or RE_NULL.match(val):
-                if RE_NULL.match(val):
-                    parent.attrs[key] = None
-                else:
-                    parent._pending_attr = key
-            else:
-                parent.attrs[key] = parse_value(val)
-            continue
-
-        if RE_NULL.match(content.strip()):
-            if stack and stack[-1][1]._pending_attr:
-                stack[-1][1].attrs[stack[-1][1]._pending_attr] = None
-                stack[-1][1]._pending_attr = None
-            continue
-
-    return root
-
-
-def indent_block(s: str, level: int):
-    if not s:
-        return ''
-    pad = '  ' * level
-    return '\n'.join(pad + line if line.strip() else line for line in s.splitlines())
-
-
-def find_child(node: Node, types):
-    for c in node.children:
-        if c.type in types:
-            return c
-    return None
-
-
-def format_ruby_block(content: str, level: int) -> str:
-    """格式化Ruby代码块，确保正确的缩进"""
-    if not content:
-        return ''
-
-    lines = content.split('\n')
-    formatted_lines = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            formatted_lines.append('')
-            continue
-
-        # 根据内容调整缩进
-        if stripped.startswith('end') or stripped.startswith('else') or stripped.startswith(
-                'elsif') or stripped.startswith('rescue') or stripped.startswith('ensure') or stripped.startswith(
-            'when'):
-            formatted_lines.append('  ' * (level - 1) + stripped)
-        else:
-            formatted_lines.append('  ' * level + stripped)
-
-    return '\n'.join(formatted_lines)
-
+from desast.args import format_method_args, render_arg_list
+from desast.beautify import (
+    BINARY_OPS,
+    RAILS_MACROS_NO_PAREN,
+    ensure_block_indent,
+    format_def_signature,
+)
+from desast.helpers import collect_list, esc_str_content, find_child
+from desast.node import Node
 
 def render_array_as_block(node: Node, level: int) -> str:
     """将 NODE_ARRAY 渲染为多行语句块"""
@@ -260,11 +95,7 @@ def render(node: Optional[Node], level=0) -> str:
         mid = node.attrs.get('nd_mid') or 'unknown_method'
         defn = node.attrs.get('nd_defn') or find_child(node, ['NODE_SCOPE'])
 
-        args = []
-        if isinstance(defn, Node):
-            tbl = defn.attrs.get('nd_tbl')
-            if isinstance(tbl, str):
-                args = [a.strip().lstrip(':') for a in tbl.split(',') if a.strip()]
+        args = format_method_args(defn) if isinstance(defn, Node) else []
 
         body = ''
         if isinstance(defn, Node):
@@ -277,7 +108,7 @@ def render(node: Optional[Node], level=0) -> str:
                 else:
                     body = render(defn, level + 1)
 
-        out = f"{'  ' * level}def {mid}({', '.join(args)})\n"
+        out = format_def_signature(mid, args, level) + "\n"
         if body:
             out += body + "\n"
         out += f"{'  ' * level}end"
@@ -319,33 +150,15 @@ def render(node: Optional[Node], level=0) -> str:
         attr_args = []
 
         if isinstance(args, Node):
-            if args.type == 'NODE_ARRAY':
-                # 收集所有参数
-                all_args = []
-                head = args.attrs.get('nd_head')
-                if isinstance(head, Node):
-                    all_args.append(render(head, 0))
-
-                for c in args.children:
-                    rendered = render(c, 0)
-                    if rendered:
-                        all_args.append(rendered)
-
-                # 最后一个参数是赋值的值，其余是属性参数（如数组索引）
+            if args.type in ('NODE_ARRAY', 'NODE_LIST'):
+                # 用 collect_list 正确遍历: 最后一个元素是赋值的值, 其余是下标/属性参数
+                all_args = [render(e, 0) for e in collect_list(args)]
                 if all_args:
                     assign_value = all_args[-1]
                     attr_args = all_args[:-1]
             else:
                 # 单个参数，就是赋值的值
                 assign_value = render(args, 0)
-
-        # 如果没有赋值值，可能是特殊情况，尝试从子节点获取
-        if not assign_value and node.children:
-            # 查找可能的赋值值
-            for child in node.children:
-                if child.type not in ['NODE_ARRAY']:
-                    assign_value = render(child, 0)
-                    break
 
         # 根据方法名确定赋值类型
         if mid == '[]=' and attr_args:
@@ -484,6 +297,11 @@ def render(node: Optional[Node], level=0) -> str:
 
         return head_s + (mid or 'UNKNOWN')
 
+    # NODE_COLON3 (顶级常量引用 ::Const, 此前缺失导致渲染成空)
+    if t == 'NODE_COLON3':
+        mid = node.attrs.get('nd_mid')
+        return '::' + str(mid or 'UNKNOWN').lstrip(':')
+
     # 常量
     if t == 'NODE_CONST':
         return node.attrs.get('nd_vid') or 'CONST'
@@ -503,29 +321,14 @@ def render(node: Optional[Node], level=0) -> str:
             if recv.type == 'NODE_IVAR':
                 recv_s = f"@{recv_s.lstrip('@')}"
 
-        # 处理参数
-        args_s = ''
-        if isinstance(args, Node):
-            if args.type == 'NODE_ARRAY':
-                # 处理参数数组
-                arg_items = []
-                head = args.attrs.get('nd_head')
-                if isinstance(head, Node):
-                    rendered_head = render(head, 0)
-                    arg_items.append(rendered_head)
-                for c in args.children:
-                    rendered = render(c, 0)
-                    # 特殊处理实例变量参数
-                    if c.type == 'NODE_IVAR':
-                        rendered = f"@{rendered.lstrip('@')}"
-                    arg_items.append(rendered)
-                args_s = ', '.join(filter(None, arg_items))
-            else:
-                # 单个参数
-                args_s = render(args, 0)
+        # 处理参数 (用 collect_list 正确遍历 cons-list, 每元素只渲染一次)
+        args_s = render_arg_list(args)
 
+        # 二元运算符: obj.method(arg) -> obj method arg
+        if mid in BINARY_OPS and recv_s and args_s:
+            call_str = f"{recv_s} {mid} {args_s}"
         # 特殊处理[]方法调用（数组/哈希访问）
-        if mid == '[]':
+        elif mid == '[]':
             if recv_s and args_s:
                 call_str = f"{recv_s}[{args_s}]"
             else:
@@ -574,27 +377,22 @@ def render(node: Optional[Node], level=0) -> str:
         mid = node.attrs.get('nd_mid') or ''
         args = node.attrs.get('nd_args')
 
-        # 处理参数
-        args_s = ''
-        if isinstance(args, Node):
-            if args.type == 'NODE_ARRAY':
-                arg_items = []
-                head = args.attrs.get('nd_head')
-                if isinstance(head, Node):
-                    arg_items.append(render(head, 0))
-                for c in args.children:
-                    rendered = render(c, 0)
-                    if rendered:
-                        arg_items.append(rendered)
-                args_s = ', '.join(filter(None, arg_items))
-            else:
-                args_s = render(args, 0)
+        # 处理参数 (用 collect_list 正确遍历 cons-list)
+        args_s = render_arg_list(args)
+
+        # 无接收者的 []/[]= = 隐式 self 下标 (ActiveRecord self[attr])
+        if mid == '[]':
+            return f"{'  ' * level}self[{args_s}]"
+        if mid == '[]=':
+            all_a = [render(e, 0) for e in collect_list(args)] if isinstance(args, Node) else []
+            if len(all_a) >= 2:
+                return f"{'  ' * level}self[{', '.join(all_a[:-1])}] = {all_a[-1]}"
 
         # DSL 方法列表（需要块的方法）
         dsl_with_block = ['post', 'get', 'put', 'delete',
                           'patch', 'head', 'options', 'params', 'namespace']
         # DSL 方法列表（不需要块的方法）
-        dsl_no_block = ['desc', 'requires', 'optional', 'error!']
+        dsl_no_block = ['desc', 'requires', 'optional']
         # Ruby特殊方法
         ruby_special = ['lambda', 'proc', 'puts', 'print', 'p']
 
@@ -619,6 +417,10 @@ def render(node: Optional[Node], level=0) -> str:
                     return f"{'  ' * level}{mid}"
         else:
             # 一般函数调用
+            if mid in RAILS_MACROS_NO_PAREN:
+                if args_s:
+                    return f"{'  ' * level}{mid} {args_s}"
+                return f"{'  ' * level}{mid}"
             if args_s:
                 return f"{'  ' * level}{mid}({args_s})"
             else:
@@ -631,8 +433,9 @@ def render(node: Optional[Node], level=0) -> str:
 
     # 全局变量引用
     if t == 'NODE_GVAR':
-        vid = node.attrs.get('nd_vid') or ''
-        return f"${vid.lstrip('$')}"
+        # MRI dump 用 nd_entry (如 :$redis), 老逻辑误用 nd_vid 导致只剩 '$'
+        vid = node.attrs.get('nd_vid') or node.attrs.get('nd_entry') or ''
+        return f"${str(vid).lstrip('$').lstrip(':')}"
 
     # 类变量引用
     if t == 'NODE_CVAR':
@@ -716,69 +519,38 @@ def render(node: Optional[Node], level=0) -> str:
 
     # NODE_STR
     if t == 'NODE_STR':
-        lit = node.attrs.get('nd_lit') or ''
-        return f'"{lit}"'
+        lit = node.attrs.get('nd_lit')
+        if lit is None:
+            lit = ''
+        return '"' + esc_str_content(lit) + '"'
 
     # NODE_DSTR - 动态字符串（字符串插值）
     if t == 'NODE_DSTR':
-        parts = []
-        lit = node.attrs.get('nd_lit', '')  # 基础字符串部分
-        if lit:
-            parts.append(lit)
+        # MRI 结构: nd_lit=首段字面量; nd_next->nd_head=首个分段(EVSTR/STR);
+        # nd_next->nd_next=剩余分段组成的 cons-list NODE_ARRAY。
+        def render_dstr_seg(seg) -> str:
+            if not isinstance(seg, Node):
+                return ''
+            if seg.type == 'NODE_STR':
+                return esc_str_content(seg.attrs.get('nd_lit') or '')
+            if seg.type == 'NODE_EVSTR':
+                body = seg.attrs.get('nd_body')
+                inner = render(body, 0).strip() if isinstance(body, Node) else ''
+                return '#{' + inner + '}'
+            # 兜底: 当作插值表达式
+            inner = render(seg, 0).strip()
+            return '#{' + inner + '}' if inner else ''
 
-        # 处理子节点（插值部分）
-        for child in node.children:
-            if child.type == 'NODE_EVSTR':
-                # 递归渲染插值内容，并确保缩进正确
-                interpolated = render(child, 0).strip()
-                if interpolated:
-                    # 移除多余的插值标记
-                    if interpolated.startswith('#{') and interpolated.endswith('}'):
-                        interpolated = interpolated[2:-1]
-                    parts.append(f"#{{{interpolated}}}")
-            elif child.type == 'NODE_STR':
-                parts.append(child.attrs.get('nd_lit', ''))
-            else:
-                rendered = render(child, 0)
-                if rendered:
-                    parts.append(rendered)
+        buf = esc_str_content(node.attrs.get('nd_lit') or '')
+        first = node.attrs.get('nd_next->nd_head')
+        if isinstance(first, Node):
+            buf += render_dstr_seg(first)
+        rest = node.attrs.get('nd_next->nd_next')
+        for seg in collect_list(rest) if isinstance(rest, Node) else []:
+            buf += render_dstr_seg(seg)
 
-        # 处理链式结构（nd_next）
-        current = node
-        while current.attrs.get('nd_next'):
-            next_node = current.attrs.get('nd_next')
-            if isinstance(next_node, Node):
-                if next_node.type == 'NODE_ARRAY':
-                    for item in next_node.children:
-                        if item.type == 'NODE_EVSTR':
-                            interpolated = render(item, 0).strip()
-                            if interpolated:
-                                # 移除多余的插值标记
-                                if interpolated.startswith('#{') and interpolated.endswith('}'):
-                                    interpolated = interpolated[2:-1]
-                                parts.append(f"#{{{interpolated}}}")
-                        elif item.type == 'NODE_STR':
-                            parts.append(item.attrs.get('nd_lit', ''))
-                current = next_node
-            else:
-                break
-
-        # 组装最终字符串
-        result = []
-        for part in parts:
-            if isinstance(part, str):
-                # 只转义必要的字符，不要过度转义
-                escaped = part.replace('\\', '\\\\').replace('"', '\\"')
-                result.append(escaped)
-            else:
-                result.append(str(part))
-
-        # 根据上下文决定是否添加缩进
-        final_str = '"' + ''.join(result) + '"'
-        if level > 0:
-            return '  ' * level + final_str
-        else:
-            return final_str
+        final_str = '"' + buf + '"'
+        return ('  ' * level + final_str) if level > 0 else final_str
 
     # NODE_EVSTR - 字符串插值表达式 #{}
     if t == 'NODE_EVSTR':
@@ -939,18 +711,14 @@ def render(node: Optional[Node], level=0) -> str:
 
     # NODE_HASH
     if t == 'NODE_HASH':
+        # MRI: NODE_HASH.nd_head 指向一条扁平 cons-list, 元素按 key,value,key,value 交替
+        arr = node.attrs.get('nd_head')
+        elems = collect_list(arr) if isinstance(arr, Node) else []
         pairs = []
-        for c in node.children:
-            if c.type == 'NODE_ARRAY' and len(c.children) >= 2:
-                key = render(c.children[0], 0)
-                value = render(c.children[1], 0)
-                # 如果key是符号（:xxx），用Ruby 1.9风格
-                if isinstance(c.children[0], Node) and c.children[0].type == 'NODE_LIT' and str(
-                        c.children[0].attrs.get('nd_lit', '')).startswith(':'):
-                    pairs.append(
-                        f"{str(c.children[0].attrs['nd_lit'])[1:]}: {value}")
-                else:
-                    pairs.append(f"{key} => {value}")
+        for i in range(0, len(elems) - 1, 2):
+            k_node, v_node = elems[i], elems[i + 1]
+            value = render(v_node, 0)
+            pairs.append(f"{render(k_node, 0)} => {value}")
 
         if not pairs:
             return '{}'
@@ -967,17 +735,13 @@ def render(node: Optional[Node], level=0) -> str:
         if node.parent and node.parent.type in ('NODE_SCOPE', 'NODE_BLOCK', 'NODE_IF', 'NODE_DEFN'):
             return render_array_as_block(node, level)
         else:
+            # 数组字面量值上下文: 用 collect_list 正确遍历并补回 [ ] 括号
             parts = []
-            head = node.attrs.get('nd_head')
-            if isinstance(head, Node):
-                rendered = render(head, 0)
+            for e in collect_list(node):
+                rendered = render(e, 0)
                 if rendered:
                     parts.append(rendered)
-            for c in node.children:
-                rendered = render(c, 0)
-                if rendered:
-                    parts.append(rendered)
-            return ', '.join(filter(None, parts))
+            return '[' + ', '.join(parts) + ']'
 
     # NODE_ZARRAY - 空数组
     if t == 'NODE_ZARRAY':
@@ -1004,15 +768,9 @@ def render(node: Optional[Node], level=0) -> str:
         while current:
             head = current.attrs.get('nd_head')
             if head:
-                # 如果是方法体最后一条语句且是变量/常量，保持方法体缩进
-                if isinstance(head, Node) and head.type in (
-                        'NODE_LVAR', 'NODE_IVAR', 'NODE_CONST', 'NODE_TRUE', 'NODE_FALSE', 'NODE_NIL'):
-                    if not current.attrs.get('nd_next'):  # 最后一条
-                        parts.append(f"{'  ' * level}{render(head, 0)}")
-                    else:
-                        parts.append(render(head, level))
-                else:
-                    parts.append(render(head, level))
+                rendered = render(head, 0)
+                if rendered:
+                    parts.append(ensure_block_indent(rendered, level))
             current = current.attrs.get('nd_next')
         return '\n'.join(filter(lambda x: x.strip(), parts))
 
@@ -1027,13 +785,7 @@ def render(node: Optional[Node], level=0) -> str:
             render(recv, 0) if isinstance(recv, Node) else ''
         )
 
-        # 处理参数（完全复用NODE_DEFN的逻辑）
-        args = []
-        if isinstance(defn, Node):
-            tbl = defn.attrs.get('nd_tbl')
-            if isinstance(tbl, str):
-                args = [a.strip().lstrip(':')
-                        for a in tbl.split(',') if a.strip()]
+        args = format_method_args(defn) if isinstance(defn, Node) else []
 
         # 处理方法体（完全复用NODE_DEFN的逻辑）
         body = ''
@@ -1045,7 +797,7 @@ def render(node: Optional[Node], level=0) -> str:
                 body = render(defn, level + 1)
 
         # 构建输出（保持相同格式）
-        out = f"{'  ' * level}def {recv_s}.{mid}({', '.join(args)})" + "\n"
+        out = format_def_signature(mid, args, level, recv=recv_s) + "\n"
         if body:
             out += body + "\n"
         out += f"{'  ' * level}end"
@@ -1067,6 +819,14 @@ def render(node: Optional[Node], level=0) -> str:
     # true 字面量 (如果将来需要添加)
     if t == 'NODE_TRUE':
         return 'true'
+
+    # nil 字面量 (此前缺失, 导致 {:k => nil} 渲染成空值)
+    if t == 'NODE_NIL':
+        return 'nil'
+
+    # 块局部变量 (与 LVAR 同样处理, 此前缺失会泄漏 Python repr)
+    if t == 'NODE_DVAR':
+        return str(node.attrs.get('nd_vid') or '').lstrip(':')
 
     # NODE_RETURN - return 语句
     if t == 'NODE_RETURN':
@@ -1202,55 +962,53 @@ def render(node: Optional[Node], level=0) -> str:
     # NODE_OP_ASGN1 - 运算符赋值（如 ary[0] += 1）
     if t == 'NODE_OP_ASGN1':
         recv = node.attrs.get('nd_recv')  # 接收者（如数组）
-        args = node.attrs.get('nd_args')  # 索引参数
-        mid = node.attrs.get('nd_mid')  # 操作符（如 :+）
-        value = node.attrs.get('nd_value')  # 赋值值
+        # MRI dump: 下标在 nd_args->nd_head, 赋值值在 nd_args->nd_body
+        args = node.attrs.get('nd_args->nd_head')
+        value = node.attrs.get('nd_args->nd_body')
+        mid = node.attrs.get('nd_mid')  # 操作符；||=/&&= 会是占位符
 
         # 处理接收者
         recv_s = render(recv, 0) if isinstance(recv, Node) else ''
 
         # 处理索引参数
-        args_s = ''
-        if isinstance(args, Node):
-            if args.type == 'NODE_ARRAY':
-                arg_items = []
-                head = args.attrs.get('nd_head')
-                if isinstance(head, Node):
-                    arg_items.append(render(head, 0))
-                for c in args.children:
-                    arg_items.append(render(c, 0))
-                args_s = ', '.join(filter(None, arg_items))
-            else:
-                args_s = render(args, 0)
+        args_s = render_arg_list(args) if isinstance(args, Node) else ''
 
         # 处理赋值值
-        value_s = render(value, 0) if isinstance(value, Node) else str(value)
+        value_s = render(value, 0) if isinstance(value, Node) else (
+            'nil' if value is None else str(value))
 
-        # 构建操作符（去掉冒号）
-        op = mid[1:] if isinstance(mid, str) and mid.startswith(':') else str(mid)
+        # 构建操作符: 普通操作符(:+ 等)直接用; ||=/&&= 在 dump 里是占位符, 默认 ||
+        if isinstance(mid, str) and mid.lstrip(':') and mid.lstrip(':')[0] in '+-*/%<>&|^':
+            op = mid.lstrip(':')
+        else:
+            op = '||'
 
         return f"{'  ' * level}{recv_s}[{args_s}] {op}= {value_s}"
 
     # NODE_OP_ASGN2 - 对象属性运算符赋值（如 obj.attr += 1）
     if t == 'NODE_OP_ASGN2':
         recv = node.attrs.get('nd_recv')  # 接收者对象
-        mid = node.attrs.get('nd_mid')  # 方法名（如 :attr）
-        op = node.attrs.get('nd_next')  # 操作符（如 :+）
+        # MRI dump: 属性名在 nd_next->nd_vid, 操作符在 nd_next->nd_mid
+        mid = node.attrs.get('nd_next->nd_vid')
+        op = node.attrs.get('nd_next->nd_mid')
         value = node.attrs.get('nd_value')  # 赋值值
 
         # 处理接收者
         recv_s = render(recv, 0) if isinstance(recv, Node) else ''
 
         # 处理方法名（去掉冒号）
-        attr = mid[1:] if isinstance(mid, str) and mid.startswith(':') else str(mid)
+        attr = str(mid).lstrip(':') if mid is not None else 'unknown'
 
         # 处理操作符（去掉冒号）
-        op = op[1:] if isinstance(op, str) and op.startswith(':') else str(op)
+        op_s = str(op).lstrip(':') if op is not None else '+'
 
         # 处理赋值值
-        value_s = render(value, 0) if isinstance(value, Node) else str(value)
+        value_s = render(value, 0) if isinstance(value, Node) else ('nil' if value is None else str(value))
 
-        return f"{'  ' * level}{recv_s}.{attr} {op}= {value_s}"
+        # ||= / &&= 与普通 op= 形式略不同
+        if op_s in ('||', '&&'):
+            return f"{'  ' * level}{recv_s}.{attr} {op_s}= {value_s}"
+        return f"{'  ' * level}{recv_s}.{attr} {op_s}= {value_s}"
 
     # NODE_OP_ASGN_AND - &&= 赋值
     if t == 'NODE_OP_ASGN_AND':
@@ -1277,18 +1035,18 @@ def render(node: Optional[Node], level=0) -> str:
         var = node.attrs.get('nd_head')  # 变量名
         value = node.attrs.get('nd_value')  # 赋值值
 
-        # 处理变量名
+        # 处理变量名 (DVAR/CONST 等也走 render, 避免泄漏 Python repr)
         var_s = ''
         if isinstance(var, Node):
-            if var.type in ('NODE_IVAR', 'NODE_LVAR', 'NODE_CVAR', 'NODE_GVAR'):
-                var_s = render(var, 0)
-            else:
-                var_s = str(var)
+            var_s = render(var, 0)
         elif isinstance(var, str):
             var_s = var.lstrip(':')
 
         # 处理赋值值
-        value_s = render(value, 0) if isinstance(value, Node) else str(value)
+        if isinstance(value, Node):
+            value_s = render(value, 0)
+        else:
+            value_s = 'nil' if value is None else str(value)
 
         return f"{'  ' * level}{var_s} ||= {value_s}"
 
@@ -1383,13 +1141,14 @@ def render(node: Optional[Node], level=0) -> str:
         vars_node = node.attrs.get('nd_head')  # 左侧变量部分
         value_node = node.attrs.get('nd_value')  # 右侧值部分
 
-        # 处理左侧变量列表
+        # 处理左侧变量列表 (用 collect_list 遍历, 仅取目标变量名, 避免卷入 nd_next 嵌套赋值)
         vars_list = []
         if isinstance(vars_node, Node):
-            if vars_node.type == 'NODE_ARRAY':
-                for child in vars_node.children:
-                    if child.type in ('NODE_LASGN', 'NODE_DASGN', 'NODE_IASGN'):
-                        var_name = child.attrs.get('nd_vid', '').lstrip(':')
+            if vars_node.type in ('NODE_ARRAY', 'NODE_LIST'):
+                for child in collect_list(vars_node):
+                    if child.type in ('NODE_LASGN', 'NODE_DASGN', 'NODE_DASGN_CURR',
+                                      'NODE_IASGN', 'NODE_GASGN', 'NODE_CVASGN', 'NODE_CDECL'):
+                        var_name = str(child.attrs.get('nd_vid') or '').lstrip(':')
                         vars_list.append(var_name)
                     else:
                         vars_list.append(render(child, 0))
@@ -1591,17 +1350,10 @@ def render(node: Optional[Node], level=0) -> str:
             return render(value, level)
         return str(value) if value else ''
 
-    # NODE_PRELUDE - 代码前导部分（如 BEGIN {}）
+    # NODE_PRELUDE - 文件级前导 (还原时省略 BEGIN{} 包装)
     if t == 'NODE_PRELUDE':
         body = node.attrs.get('nd_body')
-        body_s = render(body, level + 1) if isinstance(body, Node) else ''
-
-        out = f"{'  ' * level}BEGIN {{"
-        if body_s:
-            out += f"\n{body_s}\n{'  ' * level}}}"
-        else:
-            out += "}"
-        return out
+        return render(body, level) if isinstance(body, Node) else ''
 
     # NODE_POSTEXE - 后置执行块（如 END {}）
     if t == 'NODE_POSTEXE':
@@ -1686,21 +1438,3 @@ def render(node: Optional[Node], level=0) -> str:
             outlist.append(s)
     return '\n'.join(outlist)
 
-
-if __name__ == '__main__':
-    import sys
-
-    if len(sys.argv) != 2:
-        print(f"Usage: python {sys.argv[0]} <ast_dump_file>")
-        sys.exit(1)
-
-    with open(sys.argv[1], encoding='utf-8') as f:
-        text = f.read()
-
-    root_node = parse_dump(text)
-    if not root_node:
-        print("Parse failed or empty AST")
-        sys.exit(2)
-
-    ruby_code = render(root_node)
-    print(ruby_code)
