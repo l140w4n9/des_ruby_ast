@@ -139,6 +139,3 @@ CLI 与 `decompile()` 默认启用美化，主要包括：
 3. 运行 `python batch_test.py` 或单文件 `desast_fixed.py`
 4. 在 `_decompiled/` 下阅读还原后的 Ruby，结合路由、Gemfile 等做进一步分析
 
-## License
-
-内部研究工具，按需自行维护与扩展。
